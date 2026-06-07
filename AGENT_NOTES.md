@@ -37,12 +37,12 @@
 - Frontend — package.json + file stubs only
 
 **Phase 1 TODOs (implement to get first end-to-end upload working):**
-- [ ] `services/ingestion.py` → `parse_document()`: pypdf + python-docx + plain text
-- [ ] `services/ingestion.py` → `chunk_pages()`: RecursiveCharacterTextSplitter with tiktoken
-- [ ] `services/vector_store.py` → `query()`: per-collection query, merge + sort by distance
-- [ ] `api/documents.py` → `upload_document()`: save temp file, create DB record, background ingest
-- [ ] `api/documents.py` → `list_documents()`, `delete_document()`
-- [ ] Run `alembic init` and generate first migration from models
+- [x] `services/ingestion.py` → `parse_document()`: pypdfium2 + python-docx + plain text
+- [x] `services/ingestion.py` → `chunk_pages()`: RecursiveCharacterTextSplitter with tiktoken
+- [x] `services/vector_store.py` → `query()`: per-collection query, merge + sort by distance
+- [x] `api/documents.py` → `upload_document()`: save temp file, create DB record, background ingest
+- [x] `api/documents.py` → `list_documents()`, `delete_document()`
+- [x] Alembic migration files written manually (`alembic.ini`, `backend/db/migrations/`)
 
 **Phase 2 TODOs (get first end-to-end query working):**
 - [ ] `agent/nodes.py` → `retrieve()`: embed question, call vector_store.query()
@@ -60,6 +60,34 @@
 - Frontend stubs only — iterate Phase 3 after backend is end-to-end
 
 **Open questions:**
-- Alembic async setup — use `alembic-utils` or standard async engine pattern?
-- ChromaDB async client availability — verify `chromadb.AsyncHttpClient` is stable in 0.5.15
 - Citation parsing in SourceCard.tsx — regex on `[filename, p.N]` pattern or structured response?
+- Alembic migration testing — `alembic` only exists inside Docker, not locally. `main.py` startup hook
+  runs `create_all` which pre-creates tables, so `alembic upgrade head` will conflict on an existing DB.
+  Decision needed: remove `create_all` from startup and rely on Alembic in deploy step, or keep `create_all`
+  for dev and use `alembic stamp head` to sync state on existing DBs. Test path: wipe postgres volume,
+  run `docker compose run --rm backend alembic upgrade head` before starting the backend.
+
+---
+
+## [Phase 1 — Document Upload & Ingestion]
+
+**Status**: Complete and verified end-to-end.
+
+**What was implemented:**
+- `parse_document()` — pypdfium2 (PDF), python-docx (DOCX), plain text. Per-page extraction.
+- `chunk_pages()` — RecursiveCharacterTextSplitter, 500 tokens / 50 overlap, tracks page_number per chunk.
+- `ingest()` return type changed from `int` to `list[dict]` — returns `{id, chunk_index, page_number}` per chunk so the API can persist accurate Postgres Chunk rows with correct page numbers and matching IDs to ChromaDB.
+- `VectorStoreClient.query()` — queries each `doc_{uuid}` collection, merges, sorts by distance ascending, returns top-k.
+- `upload_document()` — 202 response, Document row (status=processing), background task with its own AsyncSession.
+- `list_documents()`, `delete_document()` — standard CRUD; delete cascades in Postgres and drops ChromaDB collection.
+- Alembic files written manually (alembic.ini, env.py, script.py.mako, versions/0001). `main.py` startup hook runs `create_all` for Docker dev, so Alembic is for production migrations.
+
+**Bugs fixed during implementation:**
+- `chromadb.AsyncHttpClient()` is an async factory (must be awaited) — fixed with lazy `_get_client()` method.
+- Background task was silently swallowing exceptions — added `logger.exception()` so full tracebacks appear in Docker logs.
+- PDF word-joining issue with pypdf — switched to pypdfium2 (Google PDFium engine, 97% quality benchmark, 35× faster, Apache 2.0 license). pdfplumber was rejected: slower and lower quality per py-pdf/benchmarks.
+
+**Key decisions:**
+- Chunk IDs are generated in `ingest()` and reused as Postgres Chunk PKs — ChromaDB and Postgres refer to the same chunk by the same UUID.
+- `VectorStoreClient` uses lazy async init (`_get_client`) because `AsyncHttpClient` must be awaited and `__init__` cannot be async. The `lru_cache` singleton in `dependencies.py` means this initialises once.
+- Alembic `env.py` uses the asyncpg URL directly (no driver swap needed for async alembic pattern).
