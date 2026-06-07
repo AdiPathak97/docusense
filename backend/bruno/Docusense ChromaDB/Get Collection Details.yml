@@ -1,0 +1,33 @@
+info:
+  name: Get Collection Details
+  type: http
+  seq: 1
+
+http:
+  method: POST
+  url: http://localhost:8000/api/v1/collections/{{collection_id}}/get
+  headers:
+    - name: Content-Type
+      value: application/json
+  body:
+    type: json
+    data: |-
+      {
+        "limit": 3,
+        "include": [
+          "documents",
+          "metadatas"
+        ]
+      }
+  auth: inherit
+
+runtime:
+  variables:
+    - name: collection_id
+      value: 470b5524-8b4f-481c-8700-3054ce6b50ca
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5
