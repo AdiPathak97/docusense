@@ -12,10 +12,15 @@ from backend.config import settings
 
 class VectorStoreClient:
     def __init__(self):
-        self._client = chromadb.AsyncHttpClient(
-            host=settings.chroma_host,
-            port=settings.chroma_port,
-        )
+        self._client = None
+
+    async def _get_client(self):
+        if self._client is None:
+            self._client = await chromadb.AsyncHttpClient(
+                host=settings.chroma_host,
+                port=settings.chroma_port,
+            )
+        return self._client
 
     def _collection_name(self, document_id: str) -> str:
         return f"doc_{document_id}"
@@ -29,7 +34,8 @@ class VectorStoreClient:
         metadatas: list[dict],
     ) -> None:
         """Upsert embedded chunks into the document's collection."""
-        collection = await self._client.get_or_create_collection(
+        client = await self._get_client()
+        collection = await client.get_or_create_collection(
             name=self._collection_name(document_id)
         )
         await collection.upsert(
@@ -47,11 +53,36 @@ class VectorStoreClient:
     ) -> list[dict]:
         """
         Query across one or more document collections.
-        Returns merged, unsorted results — caller ranks by distance.
+        Returns top_k results sorted by distance (ascending = most similar first).
         """
-        # TODO: query each collection, merge results, sort by distance, return top_k
-        raise NotImplementedError
+        all_results: list[dict] = []
+        for doc_id in document_ids:
+            client = await self._get_client()
+            try:
+                collection = await client.get_collection(self._collection_name(doc_id))
+            except Exception:
+                continue
+            result = await collection.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"],
+            )
+            ids = result["ids"][0]
+            documents = result["documents"][0]
+            metadatas = result["metadatas"][0]
+            distances = result["distances"][0]
+            for chunk_id, text, meta, dist in zip(ids, documents, metadatas, distances):
+                all_results.append({
+                    "id": chunk_id,
+                    "text": text,
+                    "metadata": meta,
+                    "distance": dist,
+                })
+
+        all_results.sort(key=lambda r: r["distance"])
+        return all_results[:top_k]
 
     async def delete_document(self, document_id: str) -> None:
         """Drop the entire collection for a document."""
-        await self._client.delete_collection(self._collection_name(document_id))
+        client = await self._get_client()
+        await client.delete_collection(self._collection_name(document_id))

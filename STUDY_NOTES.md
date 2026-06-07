@@ -19,16 +19,19 @@
 2. [Async Python](#2-async-python)
    - [2.1 async/await and the Event Loop](#21-asyncawait-and-the-event-loop)
    - [2.2 asyncio.gather — Parallel Coroutines](#22-asynciogather--parallel-coroutines)
+   - [2.3 Async Factory Functions — Awaitable Constructors](#23-async-factory-functions--awaitable-constructors)
 3. [FastAPI Patterns](#3-fastapi-patterns)
    - [3.1 Dependency Injection with Depends()](#31-dependency-injection-with-depends)
    - [3.2 lru_cache as a Singleton](#32-lru_cache-as-a-singleton)
    - [3.3 Generator Dependencies — yield in get_db()](#33-generator-dependencies--yield-in-get_db)
    - [3.4 BackgroundTasks — Non-blocking Deferred Work](#34-backgroundtasks--non-blocking-deferred-work)
+   - [3.5 Structured Error Logging — Never Swallow Exceptions Silently](#35-structured-error-logging--never-swallow-exceptions-silently)
 4. [SQLAlchemy ORM (v2)](#4-sqlalchemy-orm-v2)
    - [4.1 Mapped Annotations — Typed Columns](#41-mapped-annotations--typed-columns)
    - [4.2 Async Engine and asyncpg](#42-async-engine-and-asyncpg)
    - [4.3 Relationships and Cascade Delete](#43-relationships-and-cascade-delete)
    - [4.4 Default Values — Why Use a Lambda](#44-default-values--why-use-a-lambda)
+   - [4.5 Background Task Session Isolation](#45-background-task-session-isolation)
 5. [AI Engineering Concepts](#5-ai-engineering-concepts)
    - [5.1 RAG — Retrieval-Augmented Generation](#51-rag--retrieval-augmented-generation)
    - [5.2 Embeddings and Vector Search](#52-embeddings-and-vector-search)
@@ -36,6 +39,7 @@
    - [5.4 LangGraph — Agent Graph vs. Chain](#54-langgraph--agent-graph-vs-chain)
    - [5.5 Prompt Engineering as Code](#55-prompt-engineering-as-code)
    - [5.6 Provider Abstraction — Swappable LLMs](#56-provider-abstraction--swappable-llms)
+   - [5.7 PDF Text Extraction — Why Library Choice Matters](#57-pdf-text-extraction--why-library-choice-matters)
 6. [Changelog](#6-changelog)
 
 ---
@@ -383,6 +387,50 @@ independent of the others. Don't use it when call B depends on the result of cal
 
 ---
 
+### 2.3 Async Factory Functions — Awaitable Constructors
+
+**Concept:** Some libraries expose an async factory function instead of a regular constructor.
+Calling it returns a coroutine — you must `await` it to get the actual object. Forgetting the
+`await` gives you a coroutine object, not the client, so the first method call on it fails.
+
+**Reference:** [backend/services/vector_store.py](backend/services/vector_store.py) — `_get_client()`
+
+```python
+# ❌ Wrong — chromadb.AsyncHttpClient() returns a coroutine, not a client
+self._client = chromadb.AsyncHttpClient(host=..., port=...)
+self._client.get_or_create_collection(...)  # AttributeError: 'coroutine' has no attribute ...
+
+# ✅ Correct — await the factory call
+self._client = await chromadb.AsyncHttpClient(host=..., port=...)
+```
+
+**Problem:** `__init__` cannot be `async def`. So you can't `await` inside a constructor.
+
+**Solution — lazy initialisation:**
+```python
+class VectorStoreClient:
+    def __init__(self):
+        self._client = None   # not yet created
+
+    async def _get_client(self):
+        if self._client is None:
+            self._client = await chromadb.AsyncHttpClient(host=..., port=...)
+        return self._client
+
+    async def upsert_chunks(self, ...):
+        client = await self._get_client()   # initialises on first call, reuses after
+        collection = await client.get_or_create_collection(...)
+```
+
+**Why it's safe here:** `VectorStoreClient` is a `@lru_cache` singleton. Only one instance
+exists for the process lifetime. The first async call initialises `_client`; all subsequent
+calls reuse it. There is no true concurrency risk in a single-worker asyncio app.
+
+**Recognising the pattern:** If a library's docs show `client = await SomeClient(...)` — that's
+an async factory. Common in async HTTP libraries, async DB drivers, and async message brokers.
+
+---
+
 ## 3. FastAPI Patterns
 
 ---
@@ -519,6 +567,42 @@ reliability, use a proper task queue (Celery + Redis, or ARQ). For a portfolio a
 
 ---
 
+### 3.5 Structured Error Logging — Never Swallow Exceptions Silently
+
+**Concept:** A bare `except Exception: pass` (or setting a status flag without logging) hides
+failures completely. `logger.exception()` logs the full traceback at ERROR level — it captures
+the current exception automatically, so you don't need to pass it explicitly.
+
+**Reference:** [backend/api/documents.py](backend/api/documents.py) — `_run_ingestion()`
+
+```python
+import logging
+logger = logging.getLogger(__name__)   # ← module-level logger, named after the file
+
+async def _run_ingestion(...):
+    try:
+        ...
+    except Exception:
+        logger.exception("Ingestion failed for document %s (%s)", document_id, document_name)
+        # sets doc.status = failed, then re-raises implicitly via logger
+```
+
+**`logger.exception()` vs `logger.error()`:**
+- `logger.error("msg")` — logs the message at ERROR level
+- `logger.exception("msg")` — logs the message AND appends the full stack trace of the current
+  exception. Only valid inside an `except` block.
+
+**`logging.getLogger(__name__)`:**
+- `__name__` is the module's dotted import path (e.g. `backend.api.documents`)
+- Loggers form a hierarchy by name — `backend.api.documents` inherits config from `backend.api`,
+  then `backend`, then the root logger
+- This lets you silence or redirect logs from a whole subtree: `logging.getLogger("backend").setLevel(logging.WARNING)`
+
+**The rule:** In background tasks especially, always log before swallowing exceptions — the task
+runs outside the request/response cycle, so uncaught exceptions disappear silently otherwise.
+
+---
+
 ## 4. SQLAlchemy ORM (v2)
 
 ---
@@ -639,6 +723,43 @@ created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 This is a classic Python gotcha with mutable or dynamic default values — also seen in function
 default argument bugs (`def foo(x=[])` — the list is shared across all calls).
+
+---
+
+### 4.5 Background Task Session Isolation
+
+**Concept:** A FastAPI route's DB session (from `Depends(get_db)`) is scoped to the HTTP
+request. Once the response is sent, the session is closed. A background task runs *after* the
+response — so it cannot use the request's session. It must open its own.
+
+**Reference:** [backend/api/documents.py](backend/api/documents.py) — `_run_ingestion()`
+
+```python
+# ❌ Wrong — db session is closed by the time the background task runs
+@router.post("/upload")
+async def upload_document(background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+    background_tasks.add_task(_run_ingestion, db=db, ...)   # db will be closed!
+
+# ✅ Correct — background task opens its own session from the factory directly
+async def _run_ingestion(...):
+    async with AsyncSessionLocal() as db:   # fresh session, owned by this task
+        ...
+```
+
+**`AsyncSessionLocal`** is the `async_sessionmaker` created in `db/base.py`. Importing and
+calling it directly (outside of `Depends`) is the right pattern for code that runs outside a
+request context — background tasks, startup hooks, CLI scripts, Celery workers.
+
+**Lifecycle summary:**
+```
+Request arrives → get_db() yields session → route handler runs → response sent
+                                                                       ↓
+                                                        session closed (get_db cleanup)
+                                                        background task starts
+                                                        → opens its own AsyncSessionLocal()
+                                                        → does DB work
+                                                        → closes its own session
+```
 
 ---
 
@@ -855,8 +976,51 @@ Indispensable for rapid iteration and testing.
 
 ---
 
+### 5.7 PDF Text Extraction — Why Library Choice Matters
+
+**Concept:** PDFs don't store text — they store drawing instructions ("place glyph X at position Y").
+A text extraction library must infer word boundaries, reading order, and spacing from those
+coordinates. Different libraries do this with very different quality.
+
+**Reference:** [backend/services/ingestion.py](backend/services/ingestion.py) — `parse_document()`
+
+**Why this matters for RAG:** If the extracted text has words joined together (`"thereforethe"`
+instead of `"therefore the"`), the embedding is degraded — the tokeniser splits at unexpected
+boundaries, and semantic similarity search works on corrupted input. Garbage in, garbage out.
+
+**Benchmark findings** ([py-pdf/benchmarks](https://github.com/py-pdf/benchmarks)):
+
+| Library | Quality | Speed | Notes |
+|---|---|---|---|
+| pypdfium2 | 97% | 0.1s | Google PDFium engine (used in Chrome). Best choice. |
+| PyMuPDF | 96% | 0.1s | Excellent, but AGPL licence |
+| pypdf | 96% | 3.5s | Pure Python — good quality but 35× slower; spacing issues on some PDFs |
+| pdfplumber | 75% | 9.5s | Worst of both: slow AND low quality |
+
+**Why pypdfium2 was chosen:** Best quality score, fastest, permissive Apache 2.0 licence.
+`pypdf` was the original choice and produced the same 96% benchmark score, but had real-world
+word-joining issues on the test PDF — the benchmark average hid per-document variance.
+
+**The pymupdf4llm alternative:** Outputs Markdown (headings, tables) instead of plain text.
+Useful if you want structure-aware chunking. Rejected for v1 because markdown syntax (`##`, `**`)
+ends up embedded in chunk text sent to the LLM, adding noise without a complementary
+markdown-aware chunking strategy.
+
+**API:**
+```python
+import pypdfium2
+
+pdf = pypdfium2.PdfDocument(str(file_path))
+for i, page in enumerate(pdf, start=1):
+    textpage = page.get_textpage()
+    text = textpage.get_text_range()
+```
+
+---
+
 ## 6. Changelog
 
 | Date | Phase | What was added |
 |---|---|---|
-| Project init | Pre-implementation | §1 Python fundamentals, §2 Async Python, §3 FastAPI, §4 SQLAlchemy, §5 AI Engineering — all from reading the skeleton |
+| Project init | Pre-implementation | [§1 Python fundamentals](#1-python-backend-fundamentals), [§2 Async Python](#2-async-python), [§3 FastAPI](#3-fastapi-patterns), [§4 SQLAlchemy](#4-sqlalchemy-orm-v2), [§5 AI Engineering](#5-ai-engineering-concepts) — all from reading the skeleton |
+| Phase 1 | Document upload & ingestion | [§2.3 Async factory functions](#23-async-factory-functions--awaitable-constructors), [§3.5 Structured error logging](#35-structured-error-logging--never-swallow-exceptions-silently), [§4.5 Background task session isolation](#45-background-task-session-isolation), [§5.7 PDF extraction library choice](#57-pdf-text-extraction--why-library-choice-matters) |
