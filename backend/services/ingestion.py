@@ -22,11 +22,12 @@ def parse_document(file_path: Path, content_type: str) -> list[dict]:
     Supported: application/pdf, application/vnd.openxmlformats-officedocument.wordprocessingml.document, text/plain
     """
     if content_type == "application/pdf":
-        import pypdf
+        import pypdfium2
         pages = []
-        reader = pypdf.PdfReader(str(file_path))
-        for i, page in enumerate(reader.pages, start=1):
-            text = page.extract_text() or ""
+        pdf = pypdfium2.PdfDocument(str(file_path))
+        for i, page in enumerate(pdf, start=1):
+            textpage = page.get_textpage()
+            text = textpage.get_text_range() or ""
             if text.strip():
                 pages.append({"page_number": i, "text": text})
         return pages
