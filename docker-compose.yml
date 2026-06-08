@@ -17,6 +17,11 @@ services:
         condition: service_started
     volumes:
       - ./backend:/app/backend
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   postgres:
     image: postgres:16-alpine

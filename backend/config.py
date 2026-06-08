@@ -38,5 +38,9 @@ class Settings(BaseSettings):
     # Dev
     use_mock_llm: bool = False
 
+    # Logging
+    log_level: str = "INFO"   # DEBUG | INFO | WARNING | ERROR | CRITICAL
+    log_format: str = "plain"  # plain | json
+
 
 settings = Settings()

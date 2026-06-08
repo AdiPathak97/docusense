@@ -26,13 +26,21 @@
    - [3.3 Generator Dependencies — yield in get_db()](#33-generator-dependencies--yield-in-get_db)
    - [3.4 BackgroundTasks — Non-blocking Deferred Work](#34-backgroundtasks--non-blocking-deferred-work)
    - [3.5 Structured Error Logging — Never Swallow Exceptions Silently](#35-structured-error-logging--never-swallow-exceptions-silently)
+   - [3.6 Global Exception Handlers — Centralised HTTP Error Responses](#36-global-exception-handlers--centralised-http-error-responses)
+   - [3.7 Request-Scoped Context — ContextVar + logging.Filter](#37-request-scoped-context--contextvar--loggingfilter)
 4. [SQLAlchemy ORM (v2)](#4-sqlalchemy-orm-v2)
    - [4.1 Mapped Annotations — Typed Columns](#41-mapped-annotations--typed-columns)
    - [4.2 Async Engine and asyncpg](#42-async-engine-and-asyncpg)
    - [4.3 Relationships and Cascade Delete](#43-relationships-and-cascade-delete)
    - [4.4 Default Values — Why Use a Lambda](#44-default-values--why-use-a-lambda)
    - [4.5 Background Task Session Isolation](#45-background-task-session-isolation)
-5. [AI Engineering Concepts](#5-ai-engineering-concepts)
+5. [Logging & Observability](#5-logging--observability)
+   - [5.1 Python Logging Architecture — The Hierarchy](#51-python-logging-architecture--the-hierarchy)
+   - [5.2 dictConfig — Configuring Logging Declaratively](#52-dictconfig--configuring-logging-declaratively)
+   - [5.3 warnings vs logging — Two Separate Systems](#53-warnings-vs-logging--two-separate-systems)
+   - [5.4 exception() vs error() — When to Print a Traceback](#54-exception-vs-error--when-to-print-a-traceback)
+   - [5.5 Custom Exception Hierarchies](#55-custom-exception-hierarchies)
+6. [AI Engineering Concepts](#6-ai-engineering-concepts)
    - [5.1 RAG — Retrieval-Augmented Generation](#51-rag--retrieval-augmented-generation)
    - [5.2 Embeddings and Vector Search](#52-embeddings-and-vector-search)
    - [5.3 Chunking Strategy](#53-chunking-strategy)
@@ -40,7 +48,16 @@
    - [5.5 Prompt Engineering as Code](#55-prompt-engineering-as-code)
    - [5.6 Provider Abstraction — Swappable LLMs](#56-provider-abstraction--swappable-llms)
    - [5.7 PDF Text Extraction — Why Library Choice Matters](#57-pdf-text-extraction--why-library-choice-matters)
-6. [Changelog](#6-changelog)
+7. [Software Engineering Principles & Design Patterns](#7-software-engineering-principles--design-patterns)
+   - [7.1 Fail Fast vs Graceful Degradation](#71-fail-fast-vs-graceful-degradation)
+   - [7.2 Defense in Depth — Layered Error Handling](#72-defense-in-depth--layered-error-handling)
+   - [7.3 Chain of Responsibility Pattern](#73-chain-of-responsibility-pattern)
+   - [7.4 Separation of Concerns](#74-separation-of-concerns)
+   - [7.5 The 12-Factor App Methodology](#75-the-12-factor-app-methodology)
+   - [7.6 Observability in System Design](#76-observability-in-system-design)
+   - [7.7 Open/Closed Principle Applied to Error Hierarchies](#77-openclosed-principle-applied-to-error-hierarchies)
+   - [7.8 Correlation IDs — Tracing Requests Across Layers](#78-correlation-ids--tracing-requests-across-layers)
+8. [Changelog](#8-changelog)
 
 ---
 
@@ -570,36 +587,110 @@ reliability, use a proper task queue (Celery + Redis, or ARQ). For a portfolio a
 ### 3.5 Structured Error Logging — Never Swallow Exceptions Silently
 
 **Concept:** A bare `except Exception: pass` (or setting a status flag without logging) hides
-failures completely. `logger.exception()` logs the full traceback at ERROR level — it captures
-the current exception automatically, so you don't need to pass it explicitly.
+failures completely. Always log before swallowing an exception — in background tasks especially,
+uncaught exceptions disappear silently otherwise.
 
 **Reference:** [backend/api/documents.py](backend/api/documents.py) — `_run_ingestion()`
 
 ```python
-import logging
-logger = logging.getLogger(__name__)   # ← module-level logger, named after the file
+logger = logging.getLogger(__name__)   # module-level logger, named after the file
 
 async def _run_ingestion(...):
     try:
         ...
+    except DocuSenseError as exc:
+        logger.error("Ingestion failed [%s] — document_id=%s: %s",
+                     type(exc).__name__, document_id, exc)
+        # clean single-line log; typed message is self-describing
     except Exception:
-        logger.exception("Ingestion failed for document %s (%s)", document_id, document_name)
-        # sets doc.status = failed, then re-raises implicitly via logger
+        logger.exception("Unexpected ingestion error — document_id=%s", document_id)
+        # unknown error: log with full traceback
 ```
-
-**`logger.exception()` vs `logger.error()`:**
-- `logger.error("msg")` — logs the message at ERROR level
-- `logger.exception("msg")` — logs the message AND appends the full stack trace of the current
-  exception. Only valid inside an `except` block.
 
 **`logging.getLogger(__name__)`:**
 - `__name__` is the module's dotted import path (e.g. `backend.api.documents`)
-- Loggers form a hierarchy by name — `backend.api.documents` inherits config from `backend.api`,
-  then `backend`, then the root logger
-- This lets you silence or redirect logs from a whole subtree: `logging.getLogger("backend").setLevel(logging.WARNING)`
+- Logger inherits level/handler config from `backend` without individual setup
+- Enables subtree silencing: `logging.getLogger("backend").setLevel(logging.WARNING)`
 
-**The rule:** In background tasks especially, always log before swallowing exceptions — the task
-runs outside the request/response cycle, so uncaught exceptions disappear silently otherwise.
+See §5.4 for the full `exception()` vs `error()` rule.
+
+---
+
+### 3.6 Global Exception Handlers — Centralised HTTP Error Responses
+
+**Concept:** Register handlers on the FastAPI app for exception types. They intercept any
+exception that escapes route handlers and convert it to a structured JSON response — one place,
+consistent format, no raw stack traces ever reaching the client.
+
+**Reference:** [backend/main.py](backend/main.py) — `docusense_error_handler`, `unhandled_exception_handler`
+
+```python
+@app.exception_handler(DocuSenseError)
+async def docusense_error_handler(request: Request, exc: DocuSenseError) -> JSONResponse:
+    logger.error("DocuSenseError [%s] on %s %s: %s",
+                 type(exc).__name__, request.method, request.url.path, exc)
+    return JSONResponse(status_code=500, content={
+        "error": type(exc).__name__,   # e.g. "LLMError"
+        "detail": str(exc),            # human-readable, safe — no API keys or internal paths
+    })
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.error("Unhandled exception on %s %s", request.method, request.url.path, exc_info=True)
+    return JSONResponse(status_code=500, content={
+        "error": "InternalServerError",
+        "detail": "An unexpected error occurred. Check server logs for details.",
+        # ↑ deliberately hides exception message — raw exceptions may contain internal details
+    })
+```
+
+**Two handlers for two cases:**
+- `DocuSenseError` — typed, expected. Message is safe. Log without traceback. Client sees the error type and description.
+- `Exception` — unknown. Message is hidden from client. Full traceback logged server-side.
+
+**Registration order matters in FastAPI:** The most specific handler (subclass) is checked first.
+`DocuSenseError` matches before the bare `Exception` catch-all.
+
+---
+
+### 3.7 Request-Scoped Context — ContextVar + logging.Filter
+
+**Concept:** Attach per-request metadata (like a unique ID) to every log line emitted during
+that request — across all layers — without passing it as a function argument.
+
+**Reference:** [backend/main.py](backend/main.py) — `_request_id_var`, `_RequestIdFilter`, `request_id_middleware`
+
+```python
+# 1. A ContextVar holds the current request's ID.
+#    Each async task inherits its own copy at the point it's created.
+_request_id_var: ContextVar[str] = ContextVar("request_id", default="")
+
+# 2. A logging.Filter stamps every LogRecord with it.
+class _RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = _request_id_var.get("")
+        return True
+
+# 3. Middleware sets the ContextVar for the duration of each request.
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    rid = str(uuid.uuid4())
+    token = _request_id_var.set(rid)
+    try:
+        response = await call_next(request)
+    finally:
+        _request_id_var.reset(token)   # restore previous value (important for test isolation)
+    response.headers["X-Request-ID"] = rid
+    return response
+```
+
+**Why `ContextVar` and not a global variable:**
+- A global would be overwritten by concurrent requests — all requests would share the last-set ID
+- `ContextVar` is asyncio-safe: each coroutine inherits a *copy* of the context, so concurrent
+  requests each see their own `request_id`
+
+**Result:** Every log line from every layer carries the same `request_id`, so you can grep
+`grep "req-f4a1b2" docker_logs.txt` to see the full lifecycle of one request across all services.
 
 ---
 
@@ -763,11 +854,206 @@ Request arrives → get_db() yields session → route handler runs → response 
 
 ---
 
-## 5. AI Engineering Concepts
+## 5. Logging & Observability
 
 ---
 
-### 5.1 RAG — Retrieval-Augmented Generation
+### 5.1 Python Logging Architecture — The Hierarchy
+
+**Concept:** Python loggers form a dotted-name tree. A logger named `backend.api.documents`
+is a child of `backend.api`, which is a child of `backend`, which is a child of the root logger.
+Log records propagate up the tree until a logger with `propagate=False` stops them.
+
+**Reference:** [backend/logging_config.py](backend/logging_config.py)
+
+```
+root logger
+  └── backend               ← LOG_LEVEL (e.g. INFO)
+        ├── backend.api
+        │     └── backend.api.documents
+        ├── backend.services
+        │     ├── backend.services.llm_provider
+        │     └── backend.services.vector_store
+        └── backend.agent
+              └── backend.agent.nodes
+```
+
+**Key points:**
+- Every `logging.getLogger(__name__)` in a module creates (or reuses) the logger at that dotted path
+- Setting level on `backend` is enough — all children inherit it without individual configuration
+- `propagate=False` on `backend` means its records don't reach the root logger's handler a second time
+- Root logger is set to `WARNING` to suppress SQLAlchemy, httpx, chromadb SDK noise
+
+**Why `__name__` is the right argument:**
+```python
+# In backend/services/ingestion.py:
+logger = logging.getLogger(__name__)
+# __name__ == "backend.services.ingestion" — automatically placed in the right hierarchy
+```
+
+---
+
+### 5.2 dictConfig — Configuring Logging Declaratively
+
+**Concept:** `logging.config.dictConfig()` configures the entire logging system from a single
+dictionary. It's the preferred approach over multiple `logging.setLevel()` / `addHandler()` calls
+because it's atomic, reproducible, and readable as data.
+
+**Reference:** [backend/logging_config.py](backend/logging_config.py) — `configure_logging()`
+
+```python
+logging.config.dictConfig({
+    "version": 1,
+    "disable_existing_loggers": False,   # ← important: don't wipe loggers created at import time
+    "formatters": {
+        "default": {"format": "%(asctime)s [%(levelname)s] %(name)s [%(request_id)s] — %(message)s"}
+    },
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "stream": "ext://sys.stdout", "formatter": "default"}
+    },
+    "loggers": {
+        "backend": {"level": "INFO", "handlers": ["console"], "propagate": False}
+    },
+    "root": {"level": "WARNING", "handlers": ["console"]},
+})
+```
+
+**`disable_existing_loggers: False`** — without this, any logger that was created before
+`dictConfig` is called (e.g. at module import time) would be silently disabled. Always set to `False`.
+
+**`ext://sys.stdout`** — the `ext://` prefix tells dictConfig to look up the object in
+the Python namespace rather than treating it as a string. `sys.stdout` is the actual stream object.
+
+---
+
+### 5.3 warnings vs logging — Two Separate Systems
+
+**Concept:** Python has two completely independent systems for reporting issues:
+- `logging` — for application-level events. Controlled by logger hierarchy and handlers.
+- `warnings` — for deprecation notices and usage advisories from libraries. Controlled by `warnings.filterwarnings()`.
+
+**Reference:** [backend/logging_config.py](backend/logging_config.py) — `configure_logging()`
+
+```python
+# pypdfium2 does this internally:
+import warnings
+warnings.warn("get_text_range() will be redirected to get_text_bounded()", UserWarning)
+# This goes to stderr directly — it completely bypasses the logging system.
+# Setting root logger to WARNING has zero effect on it.
+```
+
+**Fix:**
+```python
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message=r"get_text_range\(\)",
+    category=UserWarning,
+    module=r"pypdfium2\._helpers.*",
+)
+```
+
+**Why this matters:** When you see log output from a library that you can't suppress by adjusting
+log levels — it's using `warnings.warn()`, not `logging`. The fix is always `filterwarnings`, not logger configuration.
+
+**Scope the filter tightly:** Use `module=` to match only the library that emits the warning.
+A broad `warnings.filterwarnings("ignore", category=UserWarning)` would suppress useful warnings
+from your own code and other libraries.
+
+---
+
+### 5.4 exception() vs error() — When to Print a Traceback
+
+**Concept:** `logger.exception()` logs the message *and* appends the full traceback of the current
+exception (including `__cause__` chains). `logger.error()` logs only the message. The rule for
+when to use each maps directly to whether the exception is expected or not.
+
+**Reference:** [backend/api/documents.py](backend/api/documents.py) — `_run_ingestion()`, [backend/main.py](backend/main.py) — exception handlers
+
+```python
+except DocuSenseError as exc:
+    # Typed, handled — the class name + message tell the full story.
+    # "LLMError: OpenAI embedding request failed: Connection error." is self-contained.
+    # A traceback adds noise, not information.
+    logger.error(
+        "Ingestion failed [%s] — document_id=%s: %s",
+        type(exc).__name__, document_id, exc
+    )
+
+except Exception:
+    # Unexpected — we don't know what went wrong. The stack is the only evidence.
+    logger.exception(
+        "Unexpected ingestion error — document_id=%s", document_id
+    )
+```
+
+**The rule:**
+
+| Situation | Method | Traceback? |
+|---|---|---|
+| Caught a typed `DocuSenseError` | `logger.error()` | ✗ — message is enough |
+| Caught bare `Exception` | `logger.exception()` | ✓ — need stack to diagnose |
+| Critical startup failure | `logger.critical(..., exc_info=True)` | ✓ — unexpected, need full context |
+| Global handler for untyped `Exception` | `logger.error(..., exc_info=True)` | ✓ — unexpected |
+
+**`raise X from exc`** — the `from exc` clause in `raise LLMError(...) from exc` stores the
+original exception as `__cause__`. `logger.exception()` prints this full chain, so even without
+a traceback at the API layer, the original cause is preserved for server-side debugging when you
+need it.
+
+---
+
+### 5.5 Custom Exception Hierarchies
+
+**Concept:** Define domain-specific exception classes that carry typed context. This lets callers
+catch by type (not by message string) and lets the logging layer produce clean, self-describing
+error messages without needing to inspect the raw third-party exception.
+
+**Reference:** [backend/exceptions.py](backend/exceptions.py)
+
+```python
+class DocuSenseError(Exception): pass
+
+class LLMError(DocuSenseError):
+    def __init__(self, message: str, *, provider: str = "", operation: str = ""):
+        super().__init__(message)
+        self.provider = provider      # structured context, not jammed into the string
+        self.operation = operation
+```
+
+**Why keyword-only context fields (`*`):**
+```python
+# ❌ Positional — callers must remember argument order
+raise LLMError("msg", "claude", "complete")
+
+# ✅ Keyword-only — self-documenting at the call site
+raise LLMError("msg", provider="claude", operation="complete")
+```
+
+**The wrapping pattern — `raise X from exc`:**
+```python
+try:
+    response = await self._client.messages.create(...)
+except Exception as exc:
+    raise LLMError(
+        f"Claude API request failed: {exc}",   # human-readable, safe to log/surface
+        provider="claude",
+        operation="complete",
+    ) from exc   # ← preserves original exception as __cause__ for server-side debugging
+```
+
+**`str(exc)` is the log message:** Because `super().__init__(message)` is called, `str(exc)`
+returns exactly the human-readable message. The global exception handler uses `str(exc)` directly
+in the JSON response body — it's safe because service-layer code never puts sensitive info in these messages.
+
+---
+
+## 6. AI Engineering Concepts
+
+---
+
+### 6.1 RAG — Retrieval-Augmented Generation
+
 
 **Concept:** Give an LLM access to your documents at query time — without fine-tuning or retraining.
 Retrieve the relevant text, inject it into the prompt, and let the LLM answer from that context.
@@ -794,7 +1080,7 @@ DocuSense improves on this with an extra grading step — see §5.4.
 
 ---
 
-### 5.2 Embeddings and Vector Search
+### 6.2 Embeddings and Vector Search
 
 **Concept:** An embedding model converts text into a list of floats (a vector) that encodes
 semantic meaning. Similar meanings produce vectors that are close together in the vector space.
@@ -821,7 +1107,7 @@ and `EMBEDDING_PROVIDER` are configured separately — see [backend/config.py](b
 
 ---
 
-### 5.3 Chunking Strategy
+### 6.3 Chunking Strategy
 
 **Concept:** Documents are split into smaller pieces (chunks) before embedding. Each chunk gets
 its own vector. Querying returns chunks, not whole documents.
@@ -853,7 +1139,7 @@ that re-ingestion is needed. See `CLAUDE.md §6.4`.
 
 ---
 
-### 5.4 LangGraph — Agent Graph vs. Chain
+### 6.4 LangGraph — Agent Graph vs. Chain
 
 **Concept:** A **chain** is linear: A → B → C. A **graph** (LangGraph) has named nodes, typed
 shared state, and explicit edges. Each node is independently inspectable and testable.
@@ -892,7 +1178,7 @@ The `REWRITE_SYSTEM`/`REWRITE_USER` prompts are already written in [backend/agen
 
 ---
 
-### 5.5 Prompt Engineering as Code
+### 6.5 Prompt Engineering as Code
 
 **Concept:** Prompts are code — they should be version-controlled, centralised, documented,
 and treated as a first-class engineering artefact.
@@ -942,7 +1228,7 @@ changing one requires changing the other.
 
 ---
 
-### 5.6 Provider Abstraction — Swappable LLMs
+### 6.6 Provider Abstraction — Swappable LLMs
 
 **Concept:** The rest of the application only ever calls `provider.complete(system, user)` — it
 has no knowledge of which LLM is underneath. Switching providers is a config change, not a
@@ -976,7 +1262,7 @@ Indispensable for rapid iteration and testing.
 
 ---
 
-### 5.7 PDF Text Extraction — Why Library Choice Matters
+### 6.7 PDF Text Extraction — Why Library Choice Matters
 
 **Concept:** PDFs don't store text — they store drawing instructions ("place glyph X at position Y").
 A text extraction library must infer word boundaries, reading order, and spacing from those
@@ -1018,9 +1304,247 @@ for i, page in enumerate(pdf, start=1):
 
 ---
 
-## 6. Changelog
+## 7. Software Engineering Principles & Design Patterns
+
+> These are general principles, grounded in decisions made in this codebase.
+> Each entry ties theory to concrete code so it's easier to internalise and recall.
+
+---
+
+### 7.1 Fail Fast vs Graceful Degradation
+
+**Concept:** Two opposing strategies for handling failures — which to use depends on whether
+a partial result is better than no result.
+
+**Fail fast:** Crash immediately with a clear error. Used when continuing would produce
+wrong results silently or corrupt state.
+
+**Graceful degradation:** Continue with reduced functionality. Used when partial results
+are still useful and the failure is isolated.
+
+**In DocuSense:**
+
+| Situation | Strategy | Reasoning |
+|---|---|---|
+| DB unreachable at startup | Fail fast (`sys.exit(1)`) | App can't serve any request correctly — better to crash clearly than serve silent 500s |
+| Bad `LLM_PROVIDER` env var | Fail fast (CRITICAL log + raise) | Misconfiguration — every request will fail, signal it immediately |
+| LLM fails for one chunk in `grade_docs` | Graceful degradation (skip, continue) | Other chunks may still be relevant — partial answer beats an error page |
+| LLM fails in `generate` | Fail fast (`AgentError`) | Generation is the entire point — a silent empty response is worse than an explicit error |
+| ChromaDB collection missing on delete | Graceful degradation (log WARNING, return 204) | Best-effort cleanup — document is removed from Postgres regardless |
+
+**Reference:** [backend/main.py](backend/main.py) — startup, [backend/agent/nodes.py](backend/agent/nodes.py) — `grade_docs` vs `generate`
+
+**Interview answer:** "Fail fast for misconfiguration and unrecoverable state; degrade gracefully
+when partial results are better than nothing and the failure is isolated to one component."
+
+---
+
+### 7.2 Defense in Depth — Layered Error Handling
+
+**Concept:** Multiple independent error-handling layers, each narrower in scope. If an inner
+layer misses something, the outer layer catches it. No single layer is solely responsible for
+catching everything.
+
+**Reference:** All backend layers
+
+```
+[Service layer]      Wraps third-party exceptions → LLMError, VectorStoreError, IngestionError
+        ↓ propagates if not caught
+[API layer]          Catches DocuSenseError, marks doc failed, sends HTTP response
+        ↓ propagates if not caught
+[Global handler]     Exception → "An unexpected error occurred" — nothing leaks to client
+```
+
+**Each layer has a single job:**
+- **Service layer** — wraps library exceptions into typed domain errors with context. Has no knowledge of HTTP status codes.
+- **API layer** — handles domain errors, updates system state (doc status), decides HTTP semantics.
+- **Global handler** — last line of defence. Ensures *nothing* escapes as an unformatted 500.
+
+**Analogy:** Castle walls. Even if an attacker breaches the outer wall (a library exception
+propagates past the service layer), there's an inner wall (API catch), then a keep (global handler).
+Each layer is independently valuable.
+
+---
+
+### 7.3 Chain of Responsibility Pattern
+
+**Concept:** A request (or exception) passes through a chain of handlers. Each handler either
+handles it fully or passes it to the next. No handler needs to know about the full chain.
+
+**Reference:** Error propagation across [backend/services/ingestion.py](backend/services/ingestion.py) → [backend/api/documents.py](backend/api/documents.py) → [backend/main.py](backend/main.py)
+
+```
+pypdfium2 raises OSError
+   → parse_document() catches it, raises IngestionError("Failed to parse 'report.pdf': ...")
+      → ingest() lets IngestionError propagate (already typed, nothing to add)
+         → _run_ingestion() catches DocuSenseError, logs clean ERROR, marks doc failed
+            → (if bare Exception, global handler in main.py returns safe JSON 500)
+```
+
+**Classic Gang of Four description:** A chain of receiver objects. Each decides whether to
+handle a request or pass it to the next in the chain.
+
+**The key contribution of each link:** Each handler adds *context and type* as the exception
+moves up the stack. The final handler sees a rich `IngestionError("Failed to parse 'report.pdf'...")`
+rather than a raw `OSError: [Errno 22] Invalid argument`.
+
+---
+
+### 7.4 Separation of Concerns
+
+**Concept:** Each module does one thing and has one reason to change. Mixing concerns produces
+code that is hard to test, reason about, and modify independently.
+
+**Reference:** Demonstrated by the deliberate boundaries across the backend
+
+**Applied in this codebase:**
+
+| Concern | Where it lives | Deliberately excluded from |
+|---|---|---|
+| LLM API calls | `services/llm_provider.py` | HTTP status codes, DB operations |
+| Exception taxonomy | `exceptions.py` | Zero app imports — no circular dependencies possible |
+| Logging setup | `logging_config.py` | Does NOT import `Settings` — reads raw `os.environ` to avoid import-order issues |
+| HTTP error formatting | `main.py` global handlers | No knowledge of which layer caused the error |
+| Ingestion logic | `services/ingestion.py` | Has no access to the HTTP request that triggered it |
+| DB session lifecycle | `db/base.py` + `get_db()` | Route handlers never call `session.close()` |
+
+**One subtle example:** `logging_config.py` reads `os.environ.get("LOG_LEVEL")` directly instead
+of importing `Settings`. If it imported `Settings`, then logging setup would depend on
+pydantic-settings, which might emit unformatted log lines before `configure_logging()` finishes.
+Keeping the module import-free means it can always be the first thing that executes.
+
+---
+
+### 7.5 The 12-Factor App Methodology
+
+**Concept:** 12 principles for building portable, deployable software-as-a-service.
+Originally from Heroku (2011), now industry-standard. Knowing them is expected in senior
+engineering conversations and system design interviews.
+
+**Reference:** [backend/config.py](backend/config.py), [backend/logging_config.py](backend/logging_config.py), [docker-compose.yml](docker-compose.yml)
+
+**Most important factors, applied in DocuSense:**
+
+| # | Factor | Principle | How it's applied |
+|---|---|---|---|
+| III | Config | Store config in env vars, not code | `pydantic-settings` reads all config from env; nothing hardcoded |
+| IV | Backing services | Treat DB, cache, etc. as attached resources | `DATABASE_URL`, `CHROMA_HOST` — swappable via env without code change |
+| VI | Processes | Stateless processes | No shared in-memory state between requests |
+| XI | Logs | Treat logs as event streams — write to stdout | `StreamHandler` to stdout only; Docker handles routing and retention |
+
+**Factor XI is the direct justification for the no-file-handler decision:** A process should not
+concern itself with routing or storage of its output stream. Write to stdout; let the execution
+environment (Docker, systemd, a log aggregator) decide what to do with it.
+
+**Interview tip:** Factor XI also explains why you don't `tail -f app.log` in production —
+you query a log aggregator (Datadog, Splunk, CloudWatch) that ingests stdout from all instances.
+
+---
+
+### 7.6 Observability in System Design
+
+**Concept:** Observability is the ability to understand what a system is doing from the outside,
+through its outputs. The three pillars are **logs**, **metrics**, and **traces**.
+
+| Pillar | Question it answers | Example |
+|---|---|---|
+| **Logs** | "What happened?" — discrete events | `ERROR: LLMError [provider=claude]: Connection refused` |
+| **Metrics** | "How is it performing?" — aggregated numbers | `p99 ingestion latency = 4.2s`, `embedding calls/min = 12` |
+| **Traces** | "Where did the time go?" — per-request timing breakdown | `total=820ms: parse=40ms, embed=510ms, upsert=270ms` |
+
+DocuSense v1 implements **logs only**. Metrics and traces are out of scope but the groundwork
+is laid: structured logs with `request_id` can be parsed by a log aggregator to approximate
+both (e.g. latency extracted from log timestamps, per-request traces reconstructed from `request_id`).
+
+**Log levels as a system design decision:**
+
+| Level | Meaning | When to use |
+|---|---|---|
+| DEBUG | Internal state detail | Chunk counts, embedding dims — too noisy for production |
+| INFO | Lifecycle milestones | Request accepted, ingestion complete — always-on in production |
+| WARNING | Degraded but recoverable | Chunk graded irrelevant, collection not found on delete |
+| ERROR | Handled failure that changed behaviour | Document marked failed |
+| CRITICAL | System cannot continue | DB unreachable at startup |
+
+**Structured logging upgrade path:** Plain text logs are fine for a single service. At scale,
+switch to JSON (`LOG_FORMAT=json`) so a log aggregator can filter by field:
+`level=ERROR AND provider=claude`. DocuSense supports this today — zero code change, just an env var.
+
+---
+
+### 7.7 Open/Closed Principle Applied to Error Hierarchies
+
+**Concept:** From SOLID — software entities should be **open for extension, closed for modification**.
+Adding new behaviour should not require changing existing code.
+
+**Reference:** [backend/exceptions.py](backend/exceptions.py), [backend/main.py](backend/main.py) — global handler
+
+**The global handler catches `DocuSenseError`:**
+```python
+@app.exception_handler(DocuSenseError)
+async def docusense_error_handler(request, exc: DocuSenseError):
+    return JSONResponse(status_code=500, content={
+        "error": type(exc).__name__,   # automatically uses the subclass name
+        "detail": str(exc),
+    })
+```
+
+Adding `RateLimitError(LLMError)` in the future requires:
+- Add the class to `exceptions.py` ✅ — extension
+- Raise it in `llm_provider.py` when rate-limited ✅ — extension
+- The global handler automatically formats it ✅ — zero modification
+
+To give it a `429` status code instead of `500`, register *one additional* handler:
+```python
+@app.exception_handler(RateLimitError)
+async def rate_limit_handler(request, exc):
+    return JSONResponse(status_code=429, ...)
+```
+
+The broader principle: design abstraction boundaries so that the *common case* (new subtype of
+an existing concept) requires adding code, not changing existing code.
+
+---
+
+### 7.8 Correlation IDs — Tracing Requests Across Layers
+
+**Concept:** Assign a unique ID to each request at entry and attach it to every log line produced
+during that request — across all layers. Enables reconstructing the full lifecycle of any single
+request by filtering on its ID.
+
+**Reference:** [backend/main.py](backend/main.py) — `request_id_middleware`, `_request_id_var`, `_RequestIdFilter`
+
+**In DocuSense (single service):**
+```
+15:22:10 [INFO]  backend.api.documents      [req-f4a1b2] — Document accepted — id=abc-123
+15:22:10 [DEBUG] backend.services.ingestion [req-f4a1b2] — ingest start — chunks=47
+15:22:11 [DEBUG] backend.services.vector_store [req-f4a1b2] — Connecting to ChromaDB
+15:22:11 [ERROR] backend.api.documents      [req-f4a1b2] — Ingestion failed [VectorStoreError]: ...
+```
+`grep "req-f4a1b2"` → full story in order, across all layers.
+
+**In microservices (system design context):**
+The same ID is forwarded as an HTTP header (`X-Request-ID`, `X-Trace-ID`) to every downstream
+service. Each service logs it. You reconstruct a distributed trace with nothing more than logs —
+no dedicated tracing infrastructure required at small scale.
+
+**Standard practice:**
+1. Generate at the entry point (API gateway or first service)
+2. Store in request-scoped context (`ContextVar` in Python, `AsyncLocalStorage` in Node)
+3. Stamp every log line via a `Filter` or log formatter
+4. Forward in outbound HTTP headers to downstream services
+5. Echo in the HTTP response (`X-Request-ID`) so clients can include it in bug reports
+
+**Why this matters in system design interviews:** When asked "how would you debug a latency spike
+in a distributed system?", correlation IDs are step one — before metrics, before profiling.
+You need to identify *which requests* are slow before you can understand *why* they're slow.
+
+---
+
+## 8. Changelog
 
 | Date | Phase | What was added |
 |---|---|---|
-| Project init | Pre-implementation | [§1 Python fundamentals](#1-python-backend-fundamentals), [§2 Async Python](#2-async-python), [§3 FastAPI](#3-fastapi-patterns), [§4 SQLAlchemy](#4-sqlalchemy-orm-v2), [§5 AI Engineering](#5-ai-engineering-concepts) — all from reading the skeleton |
-| Phase 1 | Document upload & ingestion | [§2.3 Async factory functions](#23-async-factory-functions--awaitable-constructors), [§3.5 Structured error logging](#35-structured-error-logging--never-swallow-exceptions-silently), [§4.5 Background task session isolation](#45-background-task-session-isolation), [§5.7 PDF extraction library choice](#57-pdf-text-extraction--why-library-choice-matters) |
+| Project init | Pre-implementation | [§1 Python fundamentals](#1-python-backend-fundamentals), [§2 Async Python](#2-async-python), [§3 FastAPI](#3-fastapi-patterns), [§4 SQLAlchemy](#4-sqlalchemy-orm-v2), [§6 AI Engineering](#6-ai-engineering-concepts) — all from reading the skeleton |
+| Phase 1 | Document upload & ingestion | [§2.3 Async factory functions](#23-async-factory-functions--awaitable-constructors), [§3.5 Structured error logging](#35-structured-error-logging--never-swallow-exceptions-silently), [§4.5 Background task session isolation](#45-background-task-session-isolation), [§6.7 PDF extraction library choice](#67-pdf-text-extraction--why-library-choice-matters) |
+| 2026-06-08 | Logging & error handling | [§3.6 Global exception handlers](#36-global-exception-handlers--centralised-http-error-responses), [§3.7 ContextVar + logging.Filter](#37-request-scoped-context--contextvar--loggingfilter), [§5 Logging & Observability](#5-logging--observability) (all 5 entries), [§7 SE Principles & Design Patterns](#7-software-engineering-principles--design-patterns) (all 8 entries) |

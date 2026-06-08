@@ -171,6 +171,8 @@ Canonical reference: `.env.example`.
 | `TOP_K_RETRIEVAL` | Chunks to retrieve per query (default: 5) |
 | `RELEVANCE_THRESHOLD` | Min grade score to keep chunk (default: 0.6) |
 | `USE_MOCK_LLM` | Bypass all API calls with canned responses (dev only) |
+| `LOG_LEVEL` | Verbosity of the `backend.*` logger: `DEBUG` / `INFO` / `WARNING` / `ERROR` (default `INFO`). Root logger is always `WARNING` — third-party suppression is unconditional. |
+| `LOG_FORMAT` | Log output format: `plain` (human-readable terminal) or `json` (machine-readable, for log aggregators). Default `plain`. |
 
 ---
 

@@ -91,3 +91,36 @@
 - Chunk IDs are generated in `ingest()` and reused as Postgres Chunk PKs — ChromaDB and Postgres refer to the same chunk by the same UUID.
 - `VectorStoreClient` uses lazy async init (`_get_client`) because `AsyncHttpClient` must be awaited and `__init__` cannot be async. The `lru_cache` singleton in `dependencies.py` means this initialises once.
 - Alembic `env.py` uses the asyncpg URL directly (no driver swap needed for async alembic pattern).
+
+---
+
+## [Logging & Error Handling]
+
+**Status**: Complete. All backend layers have structured logging and typed error handling.
+
+**What was implemented:**
+- `backend/exceptions.py` (new) — `DocuSenseError` base + `IngestionError`, `VectorStoreError`, `LLMError`, `AgentError` subclasses with typed context fields
+- `backend/logging_config.py` (new) — `configure_logging(log_level, log_format)` via `dictConfig`. Root logger always `WARNING`; `backend.*` driven by `LOG_LEVEL` env var. Stdlib-only JSON formatter opt-in via `LOG_FORMAT=json`
+- `main.py` — `configure_logging()` called first; `request_id` middleware using `contextvars.ContextVar` + `logging.Filter`; global exception handlers for `DocuSenseError` (clean JSON, no traceback) and `Exception` (safe message + full traceback); DB startup guard with `sys.exit(1)`
+- `services/llm_provider.py` — all 5 API methods wrapped → `LLMError from exc`; factory functions raise `LLMError` instead of `ValueError`; mock warning added to both `get_chat_provider` and `get_embedding_provider`
+- `services/vector_store.py` — all 4 operations wrapped → `VectorStoreError from exc`; silent `except: pass` replaced with logged WARNING
+- `services/ingestion.py` — `parse_document`, `chunk_pages`, per-chunk embedding wrapped → typed errors; INFO at start/end, DEBUG for page/chunk counts
+- `agent/nodes.py` — `grade_docs` catches `LLMError` per-chunk and continues (graceful degradation); `generate` raises `AgentError` on failure
+- `dependencies.py` — `LLMError` caught at provider init with CRITICAL log
+- `db/base.py` — DEBUG on engine creation; session error logged before re-raise
+- `api/documents.py` — split `except Exception` into `DocuSenseError` (clean one-line ERROR) and `Exception` (full traceback); silent delete swallow → logged WARNING
+- `config.py`, `.env.example` — `LOG_LEVEL` and `LOG_FORMAT` fields added
+- `docker-compose.yml` — `json-file` logging driver with 10 MB × 3 rotation on backend service
+- `CLAUDE.md §5` — `LOG_LEVEL` and `LOG_FORMAT` rows added to env vars table
+
+**Bugs encountered and resolved:**
+1. `pypdfium2` UserWarning in logs — `warnings.warn()` is separate from `logging`; fixed with `warnings.filterwarnings()` in `configure_logging()`
+2. Mock warning not firing on upload — upload only injects `get_embedding_provider_dep()`, not chat provider; added mock warning to `get_embedding_provider()` too
+3. Traceback visible for handled `LLMError` — `logger.exception()` always logs the full chain; fixed by splitting catch into `DocuSenseError` (no traceback, message is self-describing) vs `Exception` (full traceback for unknowns). Applied this rule globally: `DocuSenseError` handler in `main.py` also had `exc_info=True` removed
+
+**Key decisions:**
+- Rule: typed `DocuSenseError` → `logger.error()` no traceback; bare `Exception` → `logger.exception()` or `exc_info=True`
+- `warnings` module vs `logging` module are entirely separate systems; only `configure_logging()` knows about both
+- No file handler — stdout only, Docker `json-file` driver handles rotation and persistence
+- `LOG_LEVEL` and `LOG_FORMAT` go in `CLAUDE.md §5` (not AGENT_NOTES) because they are permanent operational knobs a fresh agent must know about
+- Docker Desktop Restart does NOT re-read `.env` / `env_file` — only `docker-compose up` does. This is Docker behaviour, not a code issue.

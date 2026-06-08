@@ -1,6 +1,6 @@
 import logging
-import tempfile
 import shutil
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -10,9 +10,10 @@ from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Backgro
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.db.base import get_db, AsyncSessionLocal
-from backend.dependencies import get_vector_store, get_embedding_provider_dep
-from backend.models.document import Document, Chunk, ProcessingStatus
+from backend.db.base import AsyncSessionLocal, get_db
+from backend.dependencies import get_embedding_provider_dep, get_vector_store
+from backend.exceptions import DocuSenseError, VectorStoreError
+from backend.models.document import Chunk, Document, ProcessingStatus
 from backend.services.ingestion import ingest
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
@@ -57,8 +58,31 @@ async def _run_ingestion(
             doc.status = ProcessingStatus.complete
             doc.chunk_count = len(ingested)
             await db.commit()
+        except DocuSenseError as exc:
+            # Typed error — the message is already self-describing (e.g.
+            # "OpenAI embedding request failed: Connection error."). Log at
+            # ERROR without traceback to keep logs readable; the root cause
+            # is embedded in the message via `raise X from exc`.
+            logger.error(
+                "Ingestion failed [%s] — document_id=%s name=%s: %s",
+                type(exc).__name__,
+                document_id,
+                document_name,
+                exc,
+            )
+            result = await db.execute(select(Document).where(Document.id == document_id))
+            doc = result.scalar_one_or_none()
+            if doc:
+                doc.status = ProcessingStatus.failed
+                await db.commit()
         except Exception:
-            logger.exception("Ingestion failed for document %s (%s)", document_id, document_name)
+            # Unexpected error — log with full traceback because we don't know
+            # what went wrong and need the stack to diagnose it.
+            logger.exception(
+                "Unexpected ingestion error — document_id=%s name=%s",
+                document_id,
+                document_name,
+            )
             result = await db.execute(select(Document).where(Document.id == document_id))
             doc = result.scalar_one_or_none()
             if doc:
@@ -96,6 +120,12 @@ async def upload_document(
     )
     db.add(doc)
     await db.commit()
+    logger.info(
+        "Document accepted — id=%s name=%s content_type=%s",
+        doc_id,
+        doc.name,
+        file.content_type,
+    )
 
     background_tasks.add_task(
         _run_ingestion,
@@ -141,7 +171,17 @@ async def delete_document(
     await db.delete(doc)
     await db.commit()
 
+    # Vector store delete is best-effort: the collection may not exist if ingestion
+    # never completed. Always return 204 regardless.
     try:
         await vector_store.delete_document(document_id)
-    except Exception:
-        pass  # collection may not exist if ingestion never completed
+    except VectorStoreError as exc:
+        logger.warning(
+            "Vector store delete skipped — document_id=%s: %s", document_id, exc
+        )
+    except Exception as exc:
+        logger.warning(
+            "Unexpected error deleting vector store collection — document_id=%s: %s",
+            document_id,
+            exc,
+        )

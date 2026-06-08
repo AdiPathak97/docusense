@@ -8,8 +8,13 @@ Adding a new chat provider: implement LLMChatProvider, register in get_chat_prov
 Adding a new embedding provider: implement EmbeddingProvider, register in get_embedding_provider().
 """
 
+import logging
 from typing import Protocol, runtime_checkable
+
 from backend.config import Settings
+from backend.exceptions import LLMError
+
+logger = logging.getLogger(__name__)
 
 
 # ── Protocols ─────────────────────────────────────────────────────────────────
@@ -39,13 +44,24 @@ class ClaudeProvider:
         self._model = settings.claude_model
 
     async def complete(self, system: str, user: str) -> str:
-        message = await self._client.messages.create(
-            model=self._model,
-            max_tokens=1024,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
-        return message.content[0].text
+        logger.debug("LLM complete — provider=claude model=%s", self._model)
+        try:
+            message = await self._client.messages.create(
+                model=self._model,
+                max_tokens=1024,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            result = message.content[0].text
+            logger.debug("LLM complete ok — provider=claude chars=%d", len(result))
+            return result
+        except Exception as exc:
+            logger.error("LLM complete failed — provider=claude: %s", exc)
+            raise LLMError(
+                f"Claude API request failed: {exc}",
+                provider="claude",
+                operation="complete",
+            ) from exc
 
 
 # ── Azure OpenAI chat ─────────────────────────────────────────────────────────
@@ -61,14 +77,25 @@ class AzureOpenAIChatProvider:
         self._deployment = settings.azure_openai_deployment_chat
 
     async def complete(self, system: str, user: str) -> str:
-        response = await self._client.chat.completions.create(
-            model=self._deployment,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
-        return response.choices[0].message.content
+        logger.debug("LLM complete — provider=azure_openai deployment=%s", self._deployment)
+        try:
+            response = await self._client.chat.completions.create(
+                model=self._deployment,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            )
+            result = response.choices[0].message.content
+            logger.debug("LLM complete ok — provider=azure_openai chars=%d", len(result))
+            return result
+        except Exception as exc:
+            logger.error("LLM complete failed — provider=azure_openai: %s", exc)
+            raise LLMError(
+                f"Azure OpenAI chat request failed: {exc}",
+                provider="azure_openai",
+                operation="complete",
+            ) from exc
 
 
 # ── OpenAI chat ───────────────────────────────────────────────────────────────
@@ -80,14 +107,25 @@ class OpenAIChatProvider:
         self._model = settings.openai_chat_model
 
     async def complete(self, system: str, user: str) -> str:
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
-        return response.choices[0].message.content
+        logger.debug("LLM complete — provider=openai model=%s", self._model)
+        try:
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            )
+            result = response.choices[0].message.content
+            logger.debug("LLM complete ok — provider=openai chars=%d", len(result))
+            return result
+        except Exception as exc:
+            logger.error("LLM complete failed — provider=openai: %s", exc)
+            raise LLMError(
+                f"OpenAI chat request failed: {exc}",
+                provider="openai",
+                operation="complete",
+            ) from exc
 
 
 # ── Azure OpenAI embeddings ───────────────────────────────────────────────────
@@ -103,11 +141,22 @@ class AzureOpenAIEmbeddingProvider:
         self._deployment = settings.azure_openai_deployment_embedding
 
     async def embed(self, text: str) -> list[float]:
-        response = await self._client.embeddings.create(
-            model=self._deployment,
-            input=text,
-        )
-        return response.data[0].embedding
+        logger.debug("Embedding — provider=azure_openai deployment=%s", self._deployment)
+        try:
+            response = await self._client.embeddings.create(
+                model=self._deployment,
+                input=text,
+            )
+            result = response.data[0].embedding
+            logger.debug("Embedding ok — provider=azure_openai dims=%d", len(result))
+            return result
+        except Exception as exc:
+            logger.error("Embedding failed — provider=azure_openai: %s", exc)
+            raise LLMError(
+                f"Azure OpenAI embedding request failed: {exc}",
+                provider="azure_openai",
+                operation="embed",
+            ) from exc
 
 
 # ── OpenAI embeddings ─────────────────────────────────────────────────────────
@@ -118,11 +167,22 @@ class OpenAIEmbeddingProvider:
         self._client = AsyncOpenAI(api_key=settings.openai_api_key)
 
     async def embed(self, text: str) -> list[float]:
-        response = await self._client.embeddings.create(
-            model="text-embedding-ada-002",
-            input=text,
-        )
-        return response.data[0].embedding
+        logger.debug("Embedding — provider=openai model=text-embedding-ada-002")
+        try:
+            response = await self._client.embeddings.create(
+                model="text-embedding-ada-002",
+                input=text,
+            )
+            result = response.data[0].embedding
+            logger.debug("Embedding ok — provider=openai dims=%d", len(result))
+            return result
+        except Exception as exc:
+            logger.error("Embedding failed — provider=openai: %s", exc)
+            raise LLMError(
+                f"OpenAI embedding request failed: {exc}",
+                provider="openai",
+                operation="embed",
+            ) from exc
 
 
 # ── Mock (USE_MOCK_LLM=true) ──────────────────────────────────────────────────
@@ -145,21 +205,44 @@ class MockEmbeddingProvider:
 
 def get_chat_provider(settings: Settings) -> LLMChatProvider:
     if settings.use_mock_llm:
+        logger.warning(
+            "Mock LLM active (USE_MOCK_LLM=true) — responses are not real"
+        )
         return MockChatProvider()
+    logger.info(
+        "Initialising chat provider — llm_provider=%s", settings.llm_provider
+    )
     if settings.llm_provider == "claude":
         return ClaudeProvider(settings)
     if settings.llm_provider == "azure_openai":
         return AzureOpenAIChatProvider(settings)
     if settings.llm_provider == "openai":
         return OpenAIChatProvider(settings)
-    raise ValueError(f"Unknown LLM_PROVIDER: {settings.llm_provider}")
+    raise LLMError(
+        f"Unknown LLM_PROVIDER: '{settings.llm_provider}'. "
+        f"Valid values: claude, azure_openai, openai.",
+        provider=settings.llm_provider,
+        operation="init",
+    )
 
 
 def get_embedding_provider(settings: Settings) -> EmbeddingProvider:
     if settings.use_mock_llm:
+        logger.warning(
+            "Mock embedding provider active (USE_MOCK_LLM=true) — embeddings are not real"
+        )
         return MockEmbeddingProvider()
+    logger.info(
+        "Initialising embedding provider — embedding_provider=%s",
+        settings.embedding_provider,
+    )
     if settings.embedding_provider == "azure_openai":
         return AzureOpenAIEmbeddingProvider(settings)
     if settings.embedding_provider == "openai":
         return OpenAIEmbeddingProvider(settings)
-    raise ValueError(f"Unknown EMBEDDING_PROVIDER: {settings.embedding_provider}")
+    raise LLMError(
+        f"Unknown EMBEDDING_PROVIDER: '{settings.embedding_provider}'. "
+        f"Valid values: azure_openai, openai.",
+        provider=settings.embedding_provider,
+        operation="init",
+    )
