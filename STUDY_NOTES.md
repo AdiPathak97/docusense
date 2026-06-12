@@ -28,6 +28,7 @@
    - [3.5 Structured Error Logging — Never Swallow Exceptions Silently](#35-structured-error-logging--never-swallow-exceptions-silently)
    - [3.6 Global Exception Handlers — Centralised HTTP Error Responses](#36-global-exception-handlers--centralised-http-error-responses)
    - [3.7 Request-Scoped Context — ContextVar + logging.Filter](#37-request-scoped-context--contextvar--loggingfilter)
+   - [3.8 db.flush() vs db.commit() — Getting Generated IDs Mid-Transaction](#38-dbflush-vs-dbcommit--getting-generated-ids-mid-transaction)
 4. [SQLAlchemy ORM (v2)](#4-sqlalchemy-orm-v2)
    - [4.1 Mapped Annotations — Typed Columns](#41-mapped-annotations--typed-columns)
    - [4.2 Async Engine and asyncpg](#42-async-engine-and-asyncpg)
@@ -48,6 +49,8 @@
    - [5.5 Prompt Engineering as Code](#55-prompt-engineering-as-code)
    - [5.6 Provider Abstraction — Swappable LLMs](#56-provider-abstraction--swappable-llms)
    - [5.7 PDF Text Extraction — Why Library Choice Matters](#57-pdf-text-extraction--why-library-choice-matters)
+   - [5.8 LangGraph Conditional Edges — Routing Between Nodes at Runtime](#58-langgraph-conditional-edges--routing-between-nodes-at-runtime)
+   - [5.9 Agentic Loop Pattern — Query Rewriting with a Max-Retry Cap](#59-agentic-loop-pattern--query-rewriting-with-a-max-retry-cap)
 7. [Software Engineering Principles & Design Patterns](#7-software-engineering-principles--design-patterns)
    - [7.1 Fail Fast vs Graceful Degradation](#71-fail-fast-vs-graceful-degradation)
    - [7.2 Defense in Depth — Layered Error Handling](#72-defense-in-depth--layered-error-handling)
@@ -57,7 +60,13 @@
    - [7.6 Observability in System Design](#76-observability-in-system-design)
    - [7.7 Open/Closed Principle Applied to Error Hierarchies](#77-openclosed-principle-applied-to-error-hierarchies)
    - [7.8 Correlation IDs — Tracing Requests Across Layers](#78-correlation-ids--tracing-requests-across-layers)
-8. [Changelog](#8-changelog)
+8. [Frontend Development — React + Vite + TypeScript](#8-frontend-development--react--vite--typescript)
+   - [8.1 Vite Dev Server + Docker — The Host Binding Problem](#81-vite-dev-server--docker--the-host-binding-problem)
+   - [8.2 Typed Axios Client Pattern](#82-typed-axios-client-pattern)
+   - [8.3 React Hooks for Async State](#83-react-hooks-for-async-state)
+   - [8.4 Polling with setInterval for Live Status Updates](#84-polling-with-setinterval-for-live-status-updates)
+   - [8.5 FormData for File Uploads](#85-formdata-for-file-uploads)
+9. [Changelog](#9-changelog)
 
 ---
 
@@ -694,6 +703,53 @@ async def request_id_middleware(request: Request, call_next):
 
 ---
 
+### 3.8 db.flush() vs db.commit() — Getting Generated IDs Mid-Transaction
+
+**Concept:** `flush()` sends pending SQL to the database *within the current transaction* without
+committing. The DB executes the INSERT and populates any server-generated or default values
+(like auto-increment IDs), which are then readable in Python — but the change is not yet
+permanent and can still be rolled back.
+
+**Reference:** [backend/api/chat.py](backend/api/chat.py) — session creation in `query()`
+
+```python
+# Without flush — session.id may not yet exist if the DB generates it
+session = ChatSession()
+db.add(session)
+# session.id is already populated here because ChatSession uses a Python-level
+# default (lambda: str(uuid.uuid4())) — no flush needed in this case.
+
+# When you DO need flush: server-side defaults (SERIAL, DEFAULT NOW(), etc.)
+# The DB generates the value; Python doesn't know it until the INSERT executes.
+db.add(some_model)
+await db.flush()         # sends INSERT to DB, populates some_model.id
+print(some_model.id)     # ✅ now available — without flush this would be None
+await db.commit()        # makes it permanent
+```
+
+**Python-side vs server-side defaults:**
+
+| Default type | Example | Flush needed? |
+|---|---|---|
+| Python lambda | `default=lambda: str(uuid.uuid4())` | ❌ — Python sets it before the INSERT |
+| Python function | `default=datetime.utcnow` | ❌ — Python sets it before the INSERT |
+| Server-side SQL | `DEFAULT gen_random_uuid()`, `SERIAL` | ✅ — DB generates it; flush to read it back |
+
+**DocuSense uses Python-level defaults** for all PKs and timestamps, so `flush()` is used
+defensively here rather than strictly required. The key pattern to remember is: if you need
+a generated value from the DB before committing, call `flush()` first.
+
+**`commit()` vs `flush()` summary:**
+
+| | `flush()` | `commit()` |
+|---|---|---|
+| Sends SQL to DB? | ✅ | ✅ |
+| Still in transaction? | ✅ (rollback still possible) | ❌ (permanent) |
+| Visible to other sessions? | ❌ (not yet) | ✅ |
+| Use when? | Need generated value mid-request | Request complete, persist permanently |
+
+---
+
 ## 4. SQLAlchemy ORM (v2)
 
 ---
@@ -1171,10 +1227,13 @@ async def grade_docs(state: AgentState, ...) -> dict:
 LangGraph merges partial returns into the shared state — no node needs to copy the parts of
 state it didn't touch.
 
-**v2 planned topology:** When `grade_docs` filters out all chunks (nothing is relevant),
-instead of returning an empty answer, the graph would loop back:
-`grade_docs → rewrite_query → retrieve → grade_docs → ...`
-The `REWRITE_SYSTEM`/`REWRITE_USER` prompts are already written in [backend/agent/prompts.py](backend/agent/prompts.py) for this.
+**v2 topology (implemented):** When `grade_docs` filters out all chunks, instead of returning
+an empty answer the graph loops back via a conditional edge — see §5.8 and §5.9:
+```
+retrieve → grade_docs → [router] → generate → END
+                            ↓  (graded_chunks empty AND rewrite_count < 2)
+                       rewrite_query → retrieve
+```
 
 ---
 
@@ -1301,6 +1360,106 @@ for i, page in enumerate(pdf, start=1):
     textpage = page.get_textpage()
     text = textpage.get_text_range()
 ```
+
+---
+
+### 6.8 LangGraph Conditional Edges — Routing Between Nodes at Runtime
+
+**Concept:** `add_conditional_edges()` lets a node's output determine which node runs next.
+A **router function** reads the current state and returns a string key that maps to the next node.
+This is how you implement branching, loops, and early exits in a LangGraph agent.
+
+**Reference:** [backend/agent/graph.py](backend/agent/graph.py) — `_route_after_grade`, `add_conditional_edges`
+
+```python
+MAX_REWRITES = 2
+
+def _route_after_grade(state: AgentState) -> str:
+    """After grade_docs: loop back to rewrite if nothing passed, else generate."""
+    if not state["graded_chunks"] and state["rewrite_count"] < MAX_REWRITES:
+        return "rewrite_query"
+    return "generate"
+
+# Wire it into the graph
+graph.add_conditional_edges(
+    "grade_docs",                          # source node
+    _route_after_grade,                    # router function (state → str)
+    {
+        "rewrite_query": "rewrite_query",  # key → node name
+        "generate":      "generate",
+    },
+)
+graph.add_edge("rewrite_query", "retrieve")  # close the loop
+```
+
+**Compare with a static edge:**
+```python
+# Static — always goes to generate
+graph.add_edge("grade_docs", "generate")
+
+# Conditional — runtime decision
+graph.add_conditional_edges("grade_docs", router_fn, {"a": "node_a", "b": "node_b"})
+```
+
+**The router function is pure:** It reads state and returns a string — no side effects.
+This makes the routing logic easy to unit-test independently of the nodes themselves:
+```python
+assert _route_after_grade({"graded_chunks": [], "rewrite_count": 0}) == "rewrite_query"
+assert _route_after_grade({"graded_chunks": [], "rewrite_count": 2}) == "generate"
+assert _route_after_grade({"graded_chunks": [chunk], "rewrite_count": 0}) == "generate"
+```
+
+**Module-level constant for the cap:** `MAX_REWRITES = 2` is defined at the top of `graph.py`.
+Making it a named constant rather than an inline `< 2` means there is one place to change it,
+and it's self-documenting at the usage site.
+
+---
+
+### 6.9 Agentic Loop Pattern — Query Rewriting with a Max-Retry Cap
+
+**Concept:** In an agentic system, when a step fails (all chunks graded irrelevant), the agent
+can *try again differently* rather than giving up. But unbounded retries cause infinite loops —
+a counter in shared state caps iterations and guarantees termination.
+
+**Reference:** [backend/agent/nodes.py](backend/agent/nodes.py) — `rewrite_query`, [backend/agent/graph.py](backend/agent/graph.py)
+
+```
+Attempt 1: question = "what is the return policy?"
+  → retrieve (top-5 chunks) → grade_docs (all filtered out)
+  → rewrite_count=0 < 2, so → rewrite_query
+
+Attempt 2: question = "refund terms and conditions"  ← reformulated
+  → retrieve (new top-5) → grade_docs (2 chunks pass)
+  → graded_chunks non-empty → generate → answer ✅
+
+Worst case (both rewrites fail):
+  → rewrite_count=2, graded_chunks=[] → generate → fallback answer
+```
+
+**The `rewrite_query` node clears stale state:**
+```python
+return {
+    "question": rewritten,
+    "rewrite_count": state["rewrite_count"] + 1,
+    "retrieved_chunks": [],   # ← must clear or retrieve sees the old chunks
+    "graded_chunks": [],      # ← must clear or grade_docs sees old (failed) results
+}
+```
+LangGraph merges partial state updates — you only need to return keys that change.
+Clearing these ensures `retrieve` starts fresh with the new question.
+
+**Why the counter lives in `AgentState`:**
+State is the only thing shared between nodes in a LangGraph graph. There is no other place to
+store per-run counters — no globals, no external DB writes mid-graph (CLAUDE.md §6.2).
+
+**Termination guarantee:** The router checks `rewrite_count < MAX_REWRITES` before routing to
+`rewrite_query`. Once the cap is hit, `generate` always runs. `generate` handles empty
+`graded_chunks` gracefully (returns a "documents don't contain enough information" fallback).
+The graph always terminates.
+
+**General principle — agentic loops need exit conditions:** Any loop in an agent graph must
+have a guaranteed termination condition that doesn't depend on the LLM behaving correctly.
+An LLM that always rewrites to something irrelevant would loop forever without the counter.
 
 ---
 
@@ -1541,10 +1700,224 @@ You need to identify *which requests* are slow before you can understand *why* t
 
 ---
 
-## 8. Changelog
+## 8. Frontend Development — React + Vite + TypeScript
+
+---
+
+### 8.1 Vite Dev Server + Docker — The Host Binding Problem
+
+**Concept:** When running inside a Docker container, a dev server must bind to `0.0.0.0`
+(all interfaces), not `localhost` / `127.0.0.1`. Docker's port mapping forwards traffic from
+the host to the container's network interface — but `localhost` inside a container only
+accepts connections *from within the same container*, not from Docker's bridge network.
+
+**Reference:** [frontend/vite.config.ts](frontend/vite.config.ts)
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    host: "0.0.0.0",   // ← accepts connections from outside the container
+    port: 3000,
+    strictPort: true,   // fail immediately if 3000 is taken (don't silently try 3001)
+  },
+});
+```
+
+**What went wrong without this:**
+```
+Container: Vite listens on 127.0.0.1:5173
+Docker maps: host:3001 → container:3000
+Result: port 3000 inside container has nothing listening → connection refused on host:3001
+```
+
+**Symptoms that point to this bug:**
+- Container shows `Local: http://localhost:5173/` but no `Network:` line
+- `docker compose ps` shows port mapping (e.g. `3001->3000`) but browser can't connect
+- The server is running fine inside the container — just not reachable from outside
+
+**The same rule applies to any dev server run in Docker:** Flask, Django, Express, FastAPI —
+always check for a `--host 0.0.0.0` flag or equivalent config option.
+
+**Vite default port is 5173** — the Dockerfile exposed 3000 but Vite wasn't using it. Two bugs
+at once: wrong host binding AND wrong port. The `vite.config.ts` fixes both.
+
+---
+
+### 8.2 Typed Axios Client Pattern
+
+**Concept:** Centralise all API calls in a single typed module. Route components call named
+functions with typed arguments and get typed return values — they never see URLs, headers, or
+status codes.
+
+**Reference:** [frontend/src/api/client.ts](frontend/src/api/client.ts)
+
+```typescript
+// One Axios instance with the base URL — change this one place to point at prod
+const http = axios.create({ baseURL: import.meta.env.VITE_API_URL ?? "http://localhost:8000" });
+
+// Typed interfaces matching the backend Pydantic response models
+export interface DocumentRecord {
+  id: string;
+  name: string;
+  status: "pending" | "processing" | "complete" | "failed";
+  chunk_count: number;
+  created_at: string;
+}
+
+// Named function — callers never construct URLs
+export async function listDocuments(): Promise<DocumentRecord[]> {
+  const res = await http.get<DocumentRecord[]>("/api/documents/");
+  return res.data;
+}
+```
+
+**`import.meta.env.VITE_API_URL`** — Vite injects env vars prefixed with `VITE_` from `.env`
+files and the container's `process.env`. At runtime in the browser, they are replaced by their
+values at build/dev-server start time. Variables without the `VITE_` prefix are stripped for
+security (never exposed to the browser).
+
+**Why a typed client over raw `fetch`:**
+- Centralised base URL and auth headers
+- TypeScript catches API shape mismatches at compile time
+- Mocking in tests: replace the client module, not individual `fetch` calls
+- If an endpoint URL changes, update one function — not every component
+
+---
+
+### 8.3 React Hooks for Async State
+
+**Concept:** React's built-in hooks manage state and side effects in function components.
+For async data fetching, the common pattern is: `useState` for the data, `useEffect` to
+trigger the fetch, `useCallback` to memoize the fetch function.
+
+**Reference:** [frontend/src/pages/Chat.tsx](frontend/src/pages/Chat.tsx)
+
+```typescript
+const [documents, setDocuments] = useState<DocumentRecord[]>([]);  // state
+const [loading, setLoading] = useState(false);
+
+// useCallback memoizes fetchDocs — same function reference across renders
+// so useEffect's dependency array stays stable (avoids infinite re-fetching)
+const fetchDocs = useCallback(async () => {
+  const docs = await listDocuments();
+  setDocuments(docs);
+}, []);  // empty deps = created once
+
+useEffect(() => {
+  fetchDocs();   // run on mount
+}, [fetchDocs]);
+```
+
+**Hook summary:**
+
+| Hook | Purpose | When to use |
+|---|---|---|
+| `useState<T>(init)` | Store a value, re-render on change | Any piece of UI state |
+| `useEffect(fn, deps)` | Run a side effect after render | Fetching data, subscriptions, timers |
+| `useCallback(fn, deps)` | Memoize a function reference | Stabilise deps for `useEffect` / child props |
+| `useRef<T>()` | Mutable ref, no re-render on change | DOM access (`inputRef.current.focus()`), timers |
+
+**The `deps` array:**
+- `[]` — run once (on mount)
+- `[a, b]` — re-run when `a` or `b` changes
+- No array — run after every render (usually a bug)
+
+**Async in `useEffect`:** `useEffect` cannot be `async` directly — return value must be a
+cleanup function or `undefined`, not a Promise. Pattern: define async function inside, call it.
+```typescript
+useEffect(() => {
+  async function load() { await fetchDocs(); }
+  load();
+}, [fetchDocs]);
+// OR: useCallback + direct call as shown above
+```
+
+---
+
+### 8.4 Polling with setInterval for Live Status Updates
+
+**Concept:** When a backend operation is async (document ingestion runs in a background task),
+the frontend must poll for status changes. `setInterval` schedules repeated calls; the cleanup
+function returned from `useEffect` clears the interval when the component unmounts.
+
+**Reference:** [frontend/src/pages/Chat.tsx](frontend/src/pages/Chat.tsx) — `POLL_INTERVAL_MS`
+
+```typescript
+const POLL_INTERVAL_MS = 4000;
+
+useEffect(() => {
+  fetchDocs();                                          // immediate first fetch
+  const id = setInterval(fetchDocs, POLL_INTERVAL_MS); // then every 4s
+  return () => clearInterval(id);                      // cleanup on unmount
+}, [fetchDocs]);
+```
+
+**Why the cleanup matters:** Without `clearInterval`, the timer keeps firing after the component
+unmounts — calling `setDocuments` on an unmounted component, which causes a React warning and
+a potential memory leak.
+
+**Polling vs WebSocket vs SSE:**
+
+| Approach | Complexity | Latency | Server load | Use when |
+|---|---|---|---|---|
+| Polling | Low | Up to `interval` | N × `1/interval` req/s | Status changes infrequently, simple setup |
+| Server-Sent Events (SSE) | Medium | Near-real-time | One long-lived connection | Server pushes updates (e.g. streaming) |
+| WebSocket | High | Real-time | One connection | Bidirectional real-time (e.g. live collaboration) |
+
+Polling at 4s is fine here: ingestion takes 2–10s, and a user seeing "processing" for a few
+extra seconds is acceptable. The alternative would be SSE from the backend ingestion task.
+
+---
+
+### 8.5 FormData for File Uploads
+
+**Concept:** HTTP file uploads use `multipart/form-data` encoding — not JSON. The browser
+packages the file binary and any other fields into a `FormData` object. The `Content-Type`
+header must include the boundary marker (Axios sets this automatically).
+
+**Reference:** [frontend/src/api/client.ts](frontend/src/api/client.ts) — `uploadDocument`
+
+```typescript
+export async function uploadDocument(file: File): Promise<UploadResponse> {
+  const form = new FormData();
+  form.append("file", file);          // key "file" must match FastAPI's File(...) param name
+
+  const res = await http.post<UploadResponse>("/api/documents/upload", form, {
+    headers: { "Content-Type": "multipart/form-data" },
+    // Axios sets the boundary automatically when Content-Type is multipart/form-data
+    // If you set it manually WITH a boundary, it will be wrong — let Axios handle it
+  });
+  return res.data;
+}
+```
+
+**FastAPI side — matching the key:**
+```python
+@router.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+    # "file" here matches form.append("file", ...) in the frontend
+```
+
+**`File` input in React:**
+```typescript
+// Get File object from an <input type="file"> ref
+const file = inputRef.current?.files?.[0];
+if (file) await uploadDocument(file);
+```
+
+**`file.name`, `file.type`, `file.size`** — the `File` object carries metadata. `file.type`
+matches MIME types like `"application/pdf"` — the same strings checked in `ALLOWED_TYPES` on
+the backend. But always validate on the server too — the browser's MIME detection is advisory.
+
+---
+
+## 9. Changelog
 
 | Date | Phase | What was added |
 |---|---|---|
 | Project init | Pre-implementation | [§1 Python fundamentals](#1-python-backend-fundamentals), [§2 Async Python](#2-async-python), [§3 FastAPI](#3-fastapi-patterns), [§4 SQLAlchemy](#4-sqlalchemy-orm-v2), [§6 AI Engineering](#6-ai-engineering-concepts) — all from reading the skeleton |
 | Phase 1 | Document upload & ingestion | [§2.3 Async factory functions](#23-async-factory-functions--awaitable-constructors), [§3.5 Structured error logging](#35-structured-error-logging--never-swallow-exceptions-silently), [§4.5 Background task session isolation](#45-background-task-session-isolation), [§6.7 PDF extraction library choice](#67-pdf-text-extraction--why-library-choice-matters) |
 | 2026-06-08 | Logging & error handling | [§3.6 Global exception handlers](#36-global-exception-handlers--centralised-http-error-responses), [§3.7 ContextVar + logging.Filter](#37-request-scoped-context--contextvar--loggingfilter), [§5 Logging & Observability](#5-logging--observability) (all 5 entries), [§7 SE Principles & Design Patterns](#7-software-engineering-principles--design-patterns) (all 8 entries) |
+| 2026-06-10 | Phase 2 — Query pipeline, rewrite loop & frontend | [§3.8 db.flush() vs db.commit()](#38-dbflush-vs-dbcommit--getting-generated-ids-mid-transaction), [§6.8 LangGraph conditional edges](#68-langgraph-conditional-edges--routing-between-nodes-at-runtime), [§6.9 Agentic loop pattern](#69-agentic-loop-pattern--query-rewriting-with-a-max-retry-cap), [§8 Frontend Development](#8-frontend-development--react--vite--typescript) (all 5 entries) |

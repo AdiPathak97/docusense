@@ -22,6 +22,9 @@ class AgentState(TypedDict):
     # Populated by grade_docs node (filtered subset of retrieved_chunks)
     graded_chunks: list[DocumentChunk]
 
+    # Incremented by rewrite_query node; caps query-rewrite loop iterations
+    rewrite_count: int
+
     # Populated by generate node
     answer: str
     sources: list[DocumentChunk]     # chunks cited in the final answer
