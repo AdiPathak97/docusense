@@ -52,6 +52,8 @@ services:
       dockerfile: Dockerfile.frontend
     ports:
       - "3001:3000"
+    environment:
+      VITE_API_URL: "http://localhost:8080"
     depends_on:
       - backend
 

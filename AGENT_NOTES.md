@@ -124,3 +124,43 @@
 - No file handler — stdout only, Docker `json-file` driver handles rotation and persistence
 - `LOG_LEVEL` and `LOG_FORMAT` go in `CLAUDE.md §5` (not AGENT_NOTES) because they are permanent operational knobs a fresh agent must know about
 - Docker Desktop Restart does NOT re-read `.env` / `env_file` — only `docker-compose up` does. This is Docker behaviour, not a code issue.
+
+---
+
+## [Phase 2 — Query Pipeline, Rewrite Loop & Frontend]
+
+**Status**: Complete.
+
+**What was implemented:**
+
+### Backend
+
+- `agent/state.py` — Added `rewrite_count: int` field to `AgentState` to cap the query-rewrite loop.
+- `agent/nodes.py` — `retrieve()` fully implemented: embeds question via `EmbeddingProvider`, queries ChromaDB via `VectorStoreClient.query()`, maps raw results to `list[DocumentChunk]`. Also added new `rewrite_query()` node: calls `REWRITE_SYSTEM/REWRITE_USER` prompt, returns reformulated question + incremented `rewrite_count` + cleared chunk lists so `retrieve` starts fresh.
+- `agent/graph.py` — Rewritten for v2 topology. `build_graph()` now accepts `embedding_provider`. Added `rewrite_query` node. Replaced the static `grade_docs → generate` edge with a conditional edge via `_route_after_grade()`: if `graded_chunks` is empty AND `rewrite_count < MAX_REWRITES (2)`, routes to `rewrite_query → retrieve`; otherwise routes to `generate`. `generate` handles the empty-chunks fallback gracefully (existing behaviour preserved).
+- `dependencies.py` — `get_compiled_graph()` now passes `embedding_provider` to `build_graph()`.
+- `api/chat.py` — Fully implemented `POST /api/chat/query`: (1) resolve or create `ChatSession` in Postgres, (2) resolve `document_ids` (if empty, fetch all complete document IDs from DB), (3) guard for zero documents, (4) build `AgentState` and `await graph.ainvoke()`, (5) persist user + assistant `Message` rows, (6) return `QueryResponse`.
+
+### Frontend
+
+- `api/client.ts` — Typed Axios wrapper: `uploadDocument`, `listDocuments`, `deleteDocument`, `queryDocuments`.
+- `components/SourceCard.tsx` — Displays a single cited chunk (document name + page + content excerpt). Does not parse inline `[file, p.N]` strings — source metadata is already structured in the API response.
+- `components/DocumentList.tsx` — Checkbox list of documents with status colour-coding and delete. Only `complete` documents are selectable.
+- `components/ChatWindow.tsx` — Auto-scrolling message thread; renders `SourceCard` list under assistant messages.
+- `pages/Upload.tsx` — File picker + upload button + status feedback.
+- `pages/Chat.tsx` — Two-panel layout: document selector sidebar (polls every 4s for status) + chat area with Enter-to-send textarea. Maintains `sessionId` across turns for conversation continuity.
+- `App.tsx` — Top-nav tabs between Chat and Upload pages (no router dependency needed).
+
+**Key decisions:**
+- `embedding_provider` is now a required arg to `build_graph()` — the `retrieve` node needs it but `graph.py` previously only injected `chat_provider` and `vector_store`.
+- `document_ids=[]` in the query request means "search all complete documents" — resolved in `chat.py` by querying Postgres for all `status=complete` document IDs before graph invocation. The graph itself always receives a concrete list.
+- Frontend source display uses structured `Source` objects from the API rather than regex-parsing inline `[filename, p.N]` strings. The inline citation format in the LLM answer text is still present for readability but the source cards are driven by the `sources` array in the response.
+- `MAX_REWRITES = 2` defined as a module-level constant in `graph.py` — easy to tune without touching routing logic.
+
+**Verification path:**
+1. `docker compose up`
+2. Upload a PDF via the Upload tab (or `POST /api/documents/upload`)
+3. Wait for status to become `complete` (Chat sidebar polls every 4s)
+4. Ask a question in the Chat tab — confirm answer + source cards appear
+5. Ask a deliberately off-topic question — check logs for `rewrite_query` node firing (`rewrite_count=1`)
+6. Check `GET /api/chat/query` response shape matches `QueryResponse` schema

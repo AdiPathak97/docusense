@@ -11,28 +11,61 @@ from backend.agent.prompts import (
     GENERATE_USER,
     GRADE_SYSTEM,
     GRADE_USER,
+    REWRITE_SYSTEM,
+    REWRITE_USER,
 )
 from backend.agent.state import AgentState, DocumentChunk
 from backend.exceptions import AgentError, LLMError
-from backend.services.llm_provider import LLMChatProvider
+from backend.services.llm_provider import EmbeddingProvider, LLMChatProvider
 from backend.services.vector_store import VectorStoreClient
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
 
 
-async def retrieve(state: AgentState, vector_store: VectorStoreClient) -> dict:
-    """Query ChromaDB and return top-k chunks."""
+async def retrieve(
+    state: AgentState,
+    vector_store: VectorStoreClient,
+    embedding_provider: EmbeddingProvider,
+) -> dict:
+    """Embed the question and return top-k chunks from ChromaDB."""
     logger.info(
-        "retrieve — document_ids=%s top_k=%d",
+        "retrieve — document_ids=%s top_k=%d rewrite_count=%d",
         state["document_ids"],
         settings.top_k_retrieval,
+        state["rewrite_count"],
     )
-    # TODO: embed the question via EmbeddingProvider, then query vector_store
-    # Return: {"retrieved_chunks": list[DocumentChunk]}
-    # VectorStoreError from vector_store.query() will propagate as AgentError
-    # via the exception handler in graph.py once implemented.
-    raise NotImplementedError
+
+    try:
+        query_vector = await embedding_provider.embed(state["question"])
+    except LLMError as exc:
+        raise AgentError(
+            f"Failed to embed question for retrieval: {exc}",
+            node="retrieve",
+        ) from exc
+
+    raw_results = await vector_store.query(
+        query_embedding=query_vector,
+        document_ids=state["document_ids"],
+        top_k=settings.top_k_retrieval,
+    )
+
+    chunks: list[DocumentChunk] = [
+        DocumentChunk(
+            chunk_id=r["id"],
+            document_id=r["metadata"]["document_id"],
+            document_name=r["metadata"]["document_name"],
+            page_number=r["metadata"]["page_number"],
+            content=r["text"],
+            relevance_score=None,
+        )
+        for r in raw_results
+    ]
+
+    logger.info(
+        "retrieve complete — chunks_returned=%d", len(chunks)
+    )
+    return {"retrieved_chunks": chunks}
 
 
 async def grade_docs(state: AgentState, chat_provider: LLMChatProvider) -> dict:
@@ -122,3 +155,39 @@ async def generate(state: AgentState, chat_provider: LLMChatProvider) -> dict:
         len(chunks),
     )
     return {"answer": answer, "sources": chunks}
+
+
+async def rewrite_query(state: AgentState, chat_provider: LLMChatProvider) -> dict:
+    """
+    Reformulate the question when grade_docs filtered out all retrieved chunks.
+    Returns an updated question and increments rewrite_count to cap loop iterations.
+    """
+    logger.info(
+        "rewrite_query — rewrite_count=%d original_question_len=%d",
+        state["rewrite_count"],
+        len(state["question"]),
+    )
+
+    try:
+        rewritten = await chat_provider.complete(
+            system=REWRITE_SYSTEM,
+            user=REWRITE_USER.format(question=state["question"]),
+        )
+    except LLMError as exc:
+        # If rewriting fails, propagate — we cannot safely continue the loop
+        raise AgentError(
+            f"Query rewriting failed: {exc}",
+            node="rewrite_query",
+        ) from exc
+
+    rewritten = rewritten.strip()
+    logger.info(
+        "rewrite_query complete — new_question_len=%d", len(rewritten)
+    )
+    return {
+        "question": rewritten,
+        "rewrite_count": state["rewrite_count"] + 1,
+        # Clear previous retrieved/graded chunks so retrieve starts fresh
+        "retrieved_chunks": [],
+        "graded_chunks": [],
+    }

@@ -51,11 +51,13 @@ def get_embedding_provider_dep() -> EmbeddingProvider:
 @lru_cache
 def get_compiled_graph():
     logger.info(
-        "Building LangGraph — chat_provider=%s vector_store=%s",
+        "Building LangGraph — chat_provider=%s embedding_provider=%s vector_store=%s",
         type(get_chat_provider_dep()).__name__,
+        type(get_embedding_provider_dep()).__name__,
         type(get_vector_store()).__name__,
     )
     return build_graph(
         chat_provider=get_chat_provider_dep(),
         vector_store=get_vector_store(),
+        embedding_provider=get_embedding_provider_dep(),
     )
