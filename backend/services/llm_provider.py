@@ -66,14 +66,44 @@ class ClaudeProvider:
 
 # ── Azure OpenAI chat ─────────────────────────────────────────────────────────
 
-class AzureOpenAIChatProvider:
-    def __init__(self, settings: Settings):
+def _is_foundry_endpoint(endpoint: str) -> bool:
+    """
+    Foundry resources expose /openai/v1/ (serverless, OpenAI-compatible).
+    Classic Azure OpenAI resources expose /openai/ (deployment-based, api-version param).
+    Detect by presence of /openai/v1 in the URL so both endpoint styles work
+    without extra config.
+    """
+    return "/openai/v1" in endpoint.rstrip("/")
+
+
+def _make_azure_client(settings: Settings):
+    """
+    Return the right async OpenAI client for the configured endpoint.
+
+    Foundry /openai/v1 endpoint → AsyncOpenAI(base_url=...) — no api-version.
+    Classic /openai/ endpoint   → AsyncAzureOpenAI(azure_endpoint=...) — api-version required.
+    """
+    endpoint = settings.azure_openai_endpoint.rstrip("/")
+    if _is_foundry_endpoint(endpoint):
+        from openai import AsyncOpenAI
+        logger.debug("Azure client mode: Foundry /openai/v1 (standard OpenAI-compatible)")
+        return AsyncOpenAI(
+            base_url=endpoint + "/",
+            api_key=settings.azure_openai_api_key,
+        )
+    else:
         from openai import AsyncAzureOpenAI
-        self._client = AsyncAzureOpenAI(
-            azure_endpoint=settings.azure_openai_endpoint,
+        logger.debug("Azure client mode: classic Azure OpenAI (deployment-based)")
+        return AsyncAzureOpenAI(
+            azure_endpoint=endpoint,
             api_key=settings.azure_openai_api_key,
             api_version=settings.azure_openai_api_version,
         )
+
+
+class AzureOpenAIChatProvider:
+    def __init__(self, settings: Settings):
+        self._client = _make_azure_client(settings)
         self._deployment = settings.azure_openai_deployment_chat
 
     async def complete(self, system: str, user: str) -> str:
@@ -132,12 +162,7 @@ class OpenAIChatProvider:
 
 class AzureOpenAIEmbeddingProvider:
     def __init__(self, settings: Settings):
-        from openai import AsyncAzureOpenAI
-        self._client = AsyncAzureOpenAI(
-            azure_endpoint=settings.azure_openai_endpoint,
-            api_key=settings.azure_openai_api_key,
-            api_version=settings.azure_openai_api_version,
-        )
+        self._client = _make_azure_client(settings)
         self._deployment = settings.azure_openai_deployment_embedding
 
     async def embed(self, text: str) -> list[float]:

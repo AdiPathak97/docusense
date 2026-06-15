@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     azure_openai_api_key: str = ""
     azure_openai_deployment_chat: str = "gpt-4o"
     azure_openai_deployment_embedding: str = "text-embedding-ada-002"
-    azure_openai_api_version: str = "2024-02-01"
+    azure_openai_api_version: str = "2025-04-01-preview"
 
     # OpenAI
     openai_api_key: str = ""
